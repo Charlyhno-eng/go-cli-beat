@@ -17,11 +17,17 @@ import (
 
 // ─── BubbleTea messages ───────────────────────────────────────────────────────
 
-// TickMsg is sent every 50 ms to refresh the visualiser and elapsed time.
+// TickMsg is sent every 50 ms to refresh the animation and elapsed time.
 type TickMsg time.Time
 
-// SongDoneMsg is sent when the current track finishes naturally.
-type SongDoneMsg struct{}
+// TrackStartedMsg confirms that the decoder and speaker accepted a track.
+type TrackStartedMsg struct{}
+
+// PauseToggledMsg carries the result of changing the speaker control.
+type PauseToggledMsg struct {
+	Paused  bool
+	Changed bool
+}
 
 // PlayErrMsg is sent when a track cannot be played (bad encoding, etc.).
 // The player will automatically skip to the next track.
@@ -61,21 +67,20 @@ type Model struct {
 	StartTime time.Time
 
 	// UI dimensions
-	Width    int
-	Height   int
-	BarCount int
-
-	Err error
+	Width               int
+	Height              int
+	Err                 error
+	ConsecutiveFailures int
 }
 
 // New builds a Model for the given music directory.
 func New(musicDir string) (*Model, error) {
-	files, err := scanMP3(musicDir)
+	files, err := scanAudio(musicDir)
 	if err != nil {
 		return nil, fmt.Errorf("cannot read %s: %w", musicDir, err)
 	}
 	if len(files) == 0 {
-		return nil, fmt.Errorf("no .mp3 files found in %s", musicDir)
+		return nil, fmt.Errorf("no audio files found in %s", musicDir)
 	}
 
 	rand.Shuffle(len(files), func(i, j int) { files[i], files[j] = files[j], files[i] })
@@ -85,30 +90,43 @@ func New(musicDir string) (*Model, error) {
 		return nil, err
 	}
 
-	const defaultBars = 32
 	return &Model{
 		MusicDir:   musicDir,
 		Playlist:   files,
 		Current:    0,
 		Engine:     engine,
-		Visualizer: visualizer.New(defaultBars),
+		Visualizer: visualizer.New(0),
 		PlayState:  StateStopped,
 		Width:      80,
 		Height:     24,
-		BarCount:   defaultBars,
 	}, nil
 }
 
-func scanMP3(dir string) ([]string, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
+func scanAudio(dir string) ([]string, error) {
+	// ffmpeg can decode many formats; this list only avoids adding unrelated
+	// files to the playlist. Walking recursively also supports artist/album
+	// folder layouts.
+	supported := map[string]bool{
+		".aac": true, ".aif": true, ".aiff": true, ".flac": true,
+		".m4a": true, ".mka": true, ".mp3": true, ".mpga": true,
+		".ogg": true, ".oga": true, ".opus": true, ".wav": true,
+		".webm": true, ".wma": true,
 	}
 	var out []string
-	for _, e := range entries {
-		if !e.IsDir() && strings.EqualFold(filepath.Ext(e.Name()), ".mp3") {
-			out = append(out, filepath.Join(dir, e.Name()))
+	err := filepath.WalkDir(dir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
+		if entry.IsDir() {
+			return nil
+		}
+		if supported[strings.ToLower(filepath.Ext(entry.Name()))] {
+			out = append(out, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -125,28 +143,42 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.Width = msg.Width
 		m.Height = msg.Height
-		m.BarCount = clampInt(m.Width/3, 8, 64)
-		m.Visualizer.Resize(m.BarCount)
 
 	case TickMsg:
 		if m.PlayState == StatePlaying {
 			m.Elapsed = time.Since(m.StartTime)
 			m.Visualizer.Tick()
+			if completed, err := m.Engine.ConsumeCompletion(); completed {
+				if err != nil {
+					return m, tea.Batch(m.skipTrack(m.Playlist[m.Current], err), tickCmd())
+				}
+				return m, tea.Batch(m.nextTrack(), tickCmd())
+			}
 		}
 		return m, tickCmd()
 
-	case SongDoneMsg:
-		return m, m.nextTrack()
+	case TrackStartedMsg:
+		m.PlayState = StatePlaying
+		m.StartTime = time.Now()
+		m.Elapsed = 0
+		m.ConsecutiveFailures = 0
+		m.Visualizer.Reset()
+		return m, nil
+
+	case PauseToggledMsg:
+		if !msg.Changed {
+			return m, nil
+		}
+		if msg.Paused {
+			m.PlayState = StatePaused
+		} else {
+			m.PlayState = StatePlaying
+			m.StartTime = time.Now().Add(-m.Elapsed)
+		}
+		return m, nil
 
 	case PlayErrMsg:
-		// Log the warning and skip automatically.
-		short := filepath.Base(msg.Path)
-		warn := fmt.Sprintf("⚠  skipped %q: %v", short, msg.Err)
-		m.SkippedMsgs = append(m.SkippedMsgs, warn)
-		if len(m.SkippedMsgs) > 3 {
-			m.SkippedMsgs = m.SkippedMsgs[len(m.SkippedMsgs)-3:]
-		}
-		return m, m.nextTrack()
+		return m, m.skipTrack(msg.Path, msg.Err)
 
 	case tea.KeyMsg:
 		return m, m.handleKey(msg)
@@ -180,38 +212,35 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 
 func (m *Model) playCurrent() tea.Cmd {
 	path := m.Playlist[m.Current]
-	// Capture a reference to the program so we can send the done message.
-	// We use a closure over `m` — safe because Update is single-threaded.
 	return func() tea.Msg {
-		err := m.Engine.Play(path, func() {
-			// This callback runs in the speaker goroutine; we cannot
-			// call Update directly. We rely on the tick loop to detect
-			// that the streamer is exhausted — but sending via the
-			// program channel is cleaner. We'll send via tea.Cmd instead.
-		})
+		err := m.Engine.Play(path, m.Visualizer.Observe)
 		if err != nil {
 			return PlayErrMsg{Path: path, Err: err}
 		}
-		m.PlayState = StatePlaying
-		m.StartTime = time.Now()
-		m.Elapsed = 0
-		m.Visualizer.Reset()
-		return nil
+		return TrackStartedMsg{}
 	}
 }
 
-
+func (m *Model) skipTrack(path string, err error) tea.Cmd {
+	short := filepath.Base(path)
+	warn := fmt.Sprintf("⚠ skipped %q: %v", short, err)
+	m.SkippedMsgs = append(m.SkippedMsgs, warn)
+	if len(m.SkippedMsgs) > 3 {
+		m.SkippedMsgs = m.SkippedMsgs[len(m.SkippedMsgs)-3:]
+	}
+	m.ConsecutiveFailures++
+	if m.ConsecutiveFailures >= len(m.Playlist) {
+		m.PlayState = StateStopped
+		m.SkippedMsgs = append(m.SkippedMsgs, "⚠ aucun fichier de la playlist ne peut être décodé")
+		return nil
+	}
+	return m.nextTrack()
+}
 
 func (m *Model) togglePause() tea.Cmd {
 	return func() tea.Msg {
-		paused := m.Engine.TogglePause()
-		if paused {
-			m.PlayState = StatePaused
-		} else {
-			m.PlayState = StatePlaying
-			m.StartTime = time.Now().Add(-m.Elapsed)
-		}
-		return nil
+		paused, changed := m.Engine.TogglePause()
+		return PauseToggledMsg{Paused: paused, Changed: changed}
 	}
 }
 
